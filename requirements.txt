@@ -1,0 +1,35 @@
+# Core trading framework
+lumibot>=3.0.0
+
+# Alpaca modern SDK (alpaca.data.*)
+alpaca-py>=0.19.0
+
+# Data & numerics
+pandas>=2.0.0
+numpy>=1.24.0
+
+# Env configuration
+python-dotenv>=1.0.0
+
+# Timezone support (ensure tzdata on minimal containers)
+tzdata>=2023.3
+
+# Polygon client used by Lumibot's PolygonDataBacktesting provider
+polygon-api-client>=1.13.0
+
+# Optional: logging helpers or CSV handling are stdlib; no extra packages required
+lumibot>=3.16.1
+alpaca-py>=0.22.0
+requests
+websockets>=11.0.0
+python-dotenv>=1.0.0
+pandas>=1.5.0
+pytz>=2022.7
+matplotlib
+scipy
+ccxt
+quantstats
+polygon-api-client>=1.13.0
+ta>=0.10.0
+yahooquery>=2.3.7
+inspect2>=0.1.2
