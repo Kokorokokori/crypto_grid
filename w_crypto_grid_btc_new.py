@@ -216,10 +216,10 @@ class CryptoGridMRStrategy(Strategy):
                 setattr(self.vars, 'state_path', None)
         except Exception:
             pass
-    # Initialize CSV logger (works on Render and locally)
-    self.grid_logger = GridTradingLogger(enabled=True)
+        # Initialize CSV logger (works on Render and locally)
+        self.grid_logger = GridTradingLogger(enabled=True)
 
-    self._load_state()
+        self._load_state()
         # Optionally clear a persisted kill from prior runs if the user has enabled trading
         if p.get("auto_clear_kill", True) and p.get("enabled", True) and self.vars.killed:
             self.vars.killed = False
