@@ -104,9 +104,11 @@ class CryptoGridMRStrategy(Strategy):
         "quote_symbol": "USD",
 
         # Grid settings
-        "ladders": 6,                  # N buy + N sell rungs
-        "step_pct": 0.004,             # 0.4% between rungs
+        "ladders": 10,                  # increase to 10 rungs for finer grid
+        # step_pct is now determined dynamically from volatility, see _compute_dynamic_step_pct
+        "step_pct": 0.004,
         "envelope_k_sigma": 2.0,       # bands = mid ± k * sigma
+        "volatility_factor": 1.5,      # multiplier for volatility-adaptive step size
         "sigma_window_sec": 60,        # rolling window for sigma (live default)
         "sigma_window_backtest_minutes": 5,  # use 5-minute window in backtests for robust sigma
         "rebuild_interval_sec": 5,     # how often to rebuild ladder (live); adapted in backtests
@@ -145,8 +147,10 @@ class CryptoGridMRStrategy(Strategy):
         # Ladder and management controls
         # Guarantee at least this many step widths inside the envelope (each side can host up to `ladders` rungs)
         "min_rungs_in_band": 5,
-        # Tolerance to keep existing orders near targets (in whole price ticks)
-        "target_tolerance_ticks": 2,
+        # Tolerance to keep existing orders near targets (in whole price ticks).  Set higher to reduce churn.
+        "target_tolerance_ticks": 10,
+        # Only rebuild ladder if mid price moves more than this percentage
+        "rebuild_mid_threshold_pct": 0.001,  # 0.1% threshold for ladder rebuilds
     }
 
     def initialize(self):
@@ -493,16 +497,25 @@ class CryptoGridMRStrategy(Strategy):
 
     # -------------------- Ladder Building & Order Placement --------------------
     def _enforced_step_pct(self):
+        """
+        Return the minimum allowable step based on fees and edge.  Actual step size
+        will be computed from volatility via _compute_dynamic_step_pct().
+        """
         p = self.get_parameters()
-        min_step = 2.0 * p["maker_fee_pct"] + float(p["min_edge_pct"])
-        step = p["step_pct"]
-        if step < min_step:
-            self.log_message(
-                f"Step pct {step:.4f} raised to {min_step:.4f} to exceed fees + edge.",
-                color="yellow",
-            )
+        return 2.0 * p["maker_fee_pct"] + float(p["min_edge_pct"])
+
+    def _compute_dynamic_step_pct(self, sigma: float) -> float:
+        """
+        Compute a volatility‑adaptive step size.  Uses a new parameter
+        `volatility_factor` (default 1.5) and ensures the result exceeds
+        the minimum step returned by _enforced_step_pct().
+        """
+        p = self.get_parameters()
+        min_step = self._enforced_step_pct()
+        volatility_factor = float(p["volatility_factor"])
+        if sigma is None or sigma <= 0:
             return min_step
-        return step
+        return max(min_step, volatility_factor * float(sigma))
 
     def _rebuild_ladder(self, mid, sigma):
         p = self.get_parameters()
@@ -514,8 +527,8 @@ class CryptoGridMRStrategy(Strategy):
             self.log_message("No valid mid price; skip ladder rebuild.", color="red")
             return
 
-        # Calculate band
-        step_pct = self._enforced_step_pct()
+        # compute volatility‑adaptive step size
+        step_pct = self._compute_dynamic_step_pct(sigma)
         if sigma is None or sigma <= 0:
             self.log_message("Sigma not ready; skipping ladder rebuild this iteration.", color="yellow")
             return
@@ -528,6 +541,15 @@ class CryptoGridMRStrategy(Strategy):
             band_pct = max(k * sigma_pct, step_pct * min_rungs)
             lower = max(1e-9, mid * (1.0 - band_pct))
             upper = mid * (1.0 + band_pct)
+
+        # Only rebuild the ladder if the mid has moved significantly since last rebuild
+        mid_threshold = float(p["rebuild_mid_threshold_pct"])  # 0.1 %
+        if self.vars.last_mid is not None and abs(mid - self.vars.last_mid) / self.vars.last_mid < mid_threshold:
+            # skip rebuild; retain existing orders and log
+            self.log_message(f"Mid move {abs(mid - self.vars.last_mid)/self.vars.last_mid:.4%} below threshold; skipping ladder rebuild.", color="yellow")
+            return
+
+        # SELECTIVE ORDER MANAGEMENT
 
         # Visualize key reference lines (keep charts clear)
         self.add_line("BTC Mid", float(mid), color="black", width=2)
