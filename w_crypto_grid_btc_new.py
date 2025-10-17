@@ -198,8 +198,12 @@ class CryptoGridMRStrategy(Strategy):
         p = self.get_parameters()
         self.base_asset = Asset(p["base_symbol"], asset_type=Asset.AssetType.CRYPTO)
 
-        # IMPORTANT: For crypto orders/quotes, use CRYPTO for the quote asset as well
-        self.quote_asset_for_orders = Asset(p["quote_symbol"], asset_type=Asset.AssetType.CRYPTO)
+        # IMPORTANT: Use FOREX for fiat/stable quote symbols so get_quote() returns valid bid/ask
+        qs = p["quote_symbol"].upper()
+        if qs in ("USD", "USDT", "USDC"):
+            self.quote_asset_for_orders = Asset(p["quote_symbol"], asset_type=Asset.AssetType.FOREX)
+        else:
+            self.quote_asset_for_orders = Asset(p["quote_symbol"], asset_type=Asset.AssetType.CRYPTO)
 
         # Rolling price windows for EMA and ATR calculation
         # IMPORTANT: Keep these out of self.vars because Lumibot persists self.vars to JSON
@@ -640,6 +644,7 @@ class CryptoGridMRStrategy(Strategy):
         now_dt = self.get_datetime()
         mid = None
         spread_pct = None
+        reasons = []
         
         try:
             # Use get_last_price like the working BTC_long.py strategy
@@ -651,8 +656,10 @@ class CryptoGridMRStrategy(Strategy):
                 print(f"DEBUG: Got BTC price from get_last_price: ${mid}")
             else:
                 print(f"DEBUG: get_last_price returned None or invalid price: {last_price}")
+                reasons.append(f"get_last_price invalid: {last_price}")
         except Exception as e:
             print(f"DEBUG: get_last_price failed: {e}")
+            reasons.append(f"get_last_price error: {e}")
             # Fallback to quote method
             try:
                 if not self.is_backtesting:
@@ -669,8 +676,18 @@ class CryptoGridMRStrategy(Strategy):
                         print(f"DEBUG: Got BTC price from quote: ${mid}")
             except Exception as e2:
                 print(f"DEBUG: get_quote also failed: {e2}")
+                reasons.append(f"get_quote error: {e2}")
         
         print(f"DEBUG: Final mid={mid}, spread_pct={spread_pct}")
+        # Diagnostic CSV: if we failed to obtain a quote, record a NO_QUOTE event once per call
+        if mid is None:
+            try:
+                self.grid_logger.log_row({
+                    'event': 'NO_QUOTE',
+                    'reason': '; '.join(reasons) if reasons else 'no price source available',
+                })
+            except Exception:
+                pass
         return mid, spread_pct
 
     def _update_ema_and_trend(self, mid):
