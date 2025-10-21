@@ -126,20 +126,20 @@ class CryptoGridMRStrategy(Strategy):
         "base_symbol": "BTC",
         "quote_symbol": "USD",
 
-        # Grid settings
-        "ladders": 8,                  # reduced from 10 to concentrate capital on fewer, wider rungs
+        # Grid settings - AGGRESSIVE for maximum trading activity
+        "ladders": 6,                  # concentrated capital on fewer rungs
         # step_pct is now determined dynamically from ATR, see _compute_dynamic_step_pct
-        "step_pct": 0.004,
-        "envelope_k_atr": 2.5,         # bands = mid ± k * ATR (increased for wider bands)
-        "rebuild_interval_sec": 60,    # how often to rebuild ladder (increased for trend filter)
+        "step_pct": 0.004,             # fallback value, actual step determined by ATR
+        "envelope_k_atr": 1.5,         # REDUCED from 2.5 - tighter bands closer to price
+        "rebuild_interval_sec": 30,    # frequent ladder refreshes (30s)
         "max_spread_pct": 0.01,        # 1% spread safety
         "max_slippage_pct": 0.10,      # informational (orders are limit)
 
-        # Trend filter settings
-        "ema_window": 50,              # EMA period for trend detection
-        "ema_slope_threshold": 0.002,  # 0.2% slope threshold for testing (reduced for more trading)
+        # Trend filter settings - LOOSENED to trade during mild trends
+        "ema_window": 20,              # fast trend detection (20-period EMA)
+        "ema_slope_threshold": 0.004,  # 0.4% slope threshold - less sensitive
         "atr_window": 14,              # ATR calculation period (standard 14-period)
-        "atr_factor": 0.5,             # multiplier for ATR-based step size
+        "atr_factor": 0.25,            # tight grid spacing (0.25x ATR factor)
         "trail_drawdown_pct": 1.0,     # kill grid if equity drops this % from high
 
     # Fees (maker/taker) - updated per request
@@ -147,18 +147,18 @@ class CryptoGridMRStrategy(Strategy):
         "taker_fee_pct": 0.0025,       # 0.25%
 
         # Risk limits
-        "max_inventory_quote": 4000.0,   # cap net USD exposure (buy-side) - increased for better per-rung exposure
-        "max_inventory_base": 0.4,       # cap net BTC inventory (sell-side) - increased proportionally
+        "max_inventory_quote": 4000.0,   # cap net USD exposure (buy-side)
+        "max_inventory_base": 0.4,       # cap net BTC inventory (sell-side)
         "max_drawdown_pct": 10.0,        # kill if equity drawdown exceeds this
         "daily_loss_limit_quote": 300.0, # kill if daily loss exceeds this USD amount
         
-        # Performance protection settings
-        "trailing_drawdown_pct": 4.0,    # flatten positions if equity falls this % from peak
-        "profit_target_pct": 8.0,        # take profits and pause when up this % from start
+        # Performance protection settings - RAISED thresholds to allow more trading
+        "trailing_drawdown_pct": 8.0,    # 8% trailing stop before flattening
+        "profit_target_pct": 15.0,       # 15% profit target before pause
         "cooldown_period_hours": 6,      # hours to pause after hitting limits
         "losing_streak_limit": 3,        # max consecutive losing days before cooldown
         "min_performance_pct": -1.0,     # pause if rolling N-day performance below this
-    "kill_switch_on_ws_stall_sec": 20,  # stale data threshold (live only) - raised to reduce spurious kills
+    "kill_switch_on_ws_stall_sec": 20,  # stale data threshold (live only)
         "flatten_on_kill": True,          # close positions when killed
 
         # Rounding/increment controls (can be overridden per exchange/pair)
@@ -167,7 +167,7 @@ class CryptoGridMRStrategy(Strategy):
         "qty_increment": None,          # e.g., 0.0001 for BTC
 
     # Profitability guard: require step to exceed fees by a margin
-    "min_edge_pct": 0.0005,        # 5 bps additional edge on top of 2x maker fee
+    "min_edge_pct": 0.0005,        # 5 bps additional edge on top of 2x maker fee (UNCHANGED)
 
         # Control switch
         "enabled": True,
@@ -180,11 +180,11 @@ class CryptoGridMRStrategy(Strategy):
 
         # Ladder and management controls
         # Guarantee at least this many step widths inside the envelope (each side can host up to `ladders` rungs)
-        "min_rungs_in_band": 5,
+        "min_rungs_in_band": 3,        # reduced from 5 to allow more rungs to fit
         # Tolerance to keep existing orders near targets (in whole price ticks).  Set higher to reduce churn.
         "target_tolerance_ticks": 20,  # increased to reduce order churn
         # Only rebuild ladder if mid price moves more than this percentage
-        "rebuild_mid_threshold_pct": 0.0005,  # 0.05% threshold for testing (reduced for more frequent rebuilds)
+        "rebuild_mid_threshold_pct": 0.0005,  # 0.05% threshold for frequent rebuilds
     }
 
     def initialize(self):
@@ -198,9 +198,9 @@ class CryptoGridMRStrategy(Strategy):
         p = self.get_parameters()
         self.base_asset = Asset(p["base_symbol"], asset_type=Asset.AssetType.CRYPTO)
 
-        # IMPORTANT: Use FOREX for fiat/stable quote symbols so get_quote() returns valid bid/ask
-        qs = p["quote_symbol"].upper()
-        if qs in ("USD", "USDT", "USDC"):
+        # IMPORTANT: For fiat quote currencies (USD, USDT, USDC), use FOREX asset type
+        # This ensures get_quote() returns valid bid/ask for BTC/USD pairs
+        if p["quote_symbol"].upper() in ("USD", "USDT", "USDC"):
             self.quote_asset_for_orders = Asset(p["quote_symbol"], asset_type=Asset.AssetType.FOREX)
         else:
             self.quote_asset_for_orders = Asset(p["quote_symbol"], asset_type=Asset.AssetType.CRYPTO)
@@ -242,7 +242,9 @@ class CryptoGridMRStrategy(Strategy):
         # Performance protection state - initialize with starting cash
         current_equity = self.cash  # Use starting cash as initial equity
         self.vars.equity_peak = current_equity  # Track highest equity reached
-        self.vars.start_equity = current_equity  # Starting equity for profit target
+        self.vars.start_equity = None           # Will be set on first iteration (persistent baseline)
+        self.vars.realised_profit = 0.0         # Track actual trading P&L from fills
+        self.vars.profit_target_triggered = False  # Debounce flag for profit target
         self.vars.paused_until = None            # Cooldown timestamp
         self.vars.consecutive_losing_days = 0    # Track losing streaks
         self.vars.last_day_pnl = 0.0            # Previous day's P&L
@@ -279,12 +281,17 @@ class CryptoGridMRStrategy(Strategy):
         # Initialize CSV logger (works on Render and locally)
         self.grid_logger = GridTradingLogger(enabled=True)
 
-        self._load_state()
-        # Optionally clear a persisted kill from prior runs if the user has enabled trading
-        if p["auto_clear_kill"] and p["enabled"] and self.vars.killed:
-            self.vars.killed = False
-            self.vars.flatten_executed = False
-            self.log_message("Kill switch cleared at startup (auto_clear_kill=True, enabled=True).", color="green")
+        # IMPORTANT: In backtesting, skip loading persisted state to avoid live account values
+        # contaminating backtest with wrong baseline equity
+        if not self.is_backtesting:
+            self._load_state()
+            # Optionally clear a persisted kill from prior runs if the user has enabled trading
+            if p["auto_clear_kill"] and p["enabled"] and self.vars.killed:
+                self.vars.killed = False
+                self.vars.flatten_executed = False
+                self.log_message("Kill switch cleared at startup (auto_clear_kill=True, enabled=True).", color="green")
+        else:
+            self.log_message("Backtest mode: starting with fresh state (ignoring persisted values)", color="cyan")
         self.log_message("Initialized crypto grid strategy with 24/7 market.", color="green")
         # Log init
         try:
@@ -295,6 +302,7 @@ class CryptoGridMRStrategy(Strategy):
     # -------------------- Utility: Persistence --------------------
     def _load_state(self):
         path = getattr(self, 'state_path', None)
+        
         if path and os.path.exists(path):
             try:
                 with open(path, "r") as f:
@@ -325,16 +333,30 @@ class CryptoGridMRStrategy(Strategy):
                 self.vars.trend_active = bool(data.get("trend_active", False))
                 
                 # Restore performance protection state
-                self.vars.equity_peak = data.get("equity_peak", current_equity)
-                self.vars.start_equity = data.get("start_equity", current_equity)
+                # IMPORTANT: start_equity is a persistent baseline - only set if None
+                self.vars.start_equity = data.get("start_equity")  # Will be initialized on first iteration if None
+                
+                # Restore realized profit tracking
+                self.vars.realised_profit = data.get("realised_profit", 0.0)
+                self.vars.profit_target_triggered = data.get("profit_target_triggered", False)
+                
+                # Similarly validate equity_peak
+                saved_peak = data.get("equity_peak", current_equity)
+                self.vars.equity_peak = max(saved_peak, current_equity)
+                
                 self.vars.paused_until = data.get("paused_until")
                 self.vars.consecutive_losing_days = data.get("consecutive_losing_days", 0)
                 self.vars.last_day_pnl = data.get("last_day_pnl", 0.0)
+                
                 self.log_message("State loaded from disk; will reconcile on first iteration.", color="yellow")
             except Exception as e:
                 self.log_message(f"Failed to load state: {e}", color="red")
 
     def _save_state(self):
+        # Skip saving state in backtesting to avoid contaminating live state file
+        if self.is_backtesting:
+            return
+            
         data = {
             "killed": self.vars.killed,
             "last_mid": self.vars.last_mid,
@@ -347,6 +369,8 @@ class CryptoGridMRStrategy(Strategy):
             "trend_active": self.vars.trend_active,
             "equity_peak": self.vars.equity_peak,
             "start_equity": self.vars.start_equity,
+            "realised_profit": self.vars.realised_profit,
+            "profit_target_triggered": self.vars.profit_target_triggered,
             "paused_until": self.vars.paused_until,
             "consecutive_losing_days": self.vars.consecutive_losing_days,
             "last_day_pnl": self.vars.last_day_pnl,
@@ -464,9 +488,11 @@ class CryptoGridMRStrategy(Strategy):
             self.vars.daily_start_equity = equity
             print(f"DEBUG: Initialized daily_start_equity to {equity}")
         
-        # Initialize start_equity if not set
+        # Initialize start_equity if not set (ONLY on first run, then persist)
         if self.vars.start_equity is None or self.vars.start_equity == 0:
             self.vars.start_equity = equity
+            print(f"DEBUG: Initialized start_equity baseline to {equity}")
+            self._save_state()  # Persist immediately
             
         # Calculate various drawdown and profit metrics
         if (self.vars.equity_highwater or 0) > 0:
@@ -482,16 +508,20 @@ class CryptoGridMRStrategy(Strategy):
         else:
             trailing_dd = 0.0
             
-        # Profit from start
+        # CRITICAL: Use REALIZED profit from actual fills, not equity change
+        # Equity changes include deposits/withdrawals and unrealized P&L
         if (self.vars.start_equity or 0) > 0:
-            total_profit_pct = (equity - self.vars.start_equity) / self.vars.start_equity
+            total_profit_pct = self.vars.realised_profit / self.vars.start_equity
         else:
             total_profit_pct = 0.0
+        
+        # Unrealized P&L for reference (not used for profit target)
+        unrealised_pnl = equity - self.vars.start_equity if self.vars.start_equity else 0.0
 
-        print(f"DEBUG: Risk check - equity={equity:.2f}, peak={self.vars.equity_peak}, trailing_dd={trailing_dd*100:.2f}%, profit={total_profit_pct*100:.2f}%")
+        print(f"DEBUG: Risk check - equity={equity:.2f}, start_equity={self.vars.start_equity:.2f}, realised_profit={self.vars.realised_profit:.2f}, unrealised_pnl={unrealised_pnl:.2f}, profit%={total_profit_pct*100:.2f}%")
 
         self.log_message(
-            f"Risk: equity=${equity:.0f}, trailing_dd={trailing_dd*100:.1f}%, profit={total_profit_pct*100:.1f}%",
+            f"Risk: equity=${equity:.0f}, trailing_dd={trailing_dd*100:.1f}%, realised_profit={total_profit_pct*100:.1f}%",
             color="blue",
         )
 
@@ -513,20 +543,24 @@ class CryptoGridMRStrategy(Strategy):
             self._activate_performance_pause("Trailing drawdown limit hit", p["cooldown_period_hours"])
             return
             
-        # NEW: Profit target check
+        # NEW: Profit target check (DEBOUNCED - only trigger once)
         if total_profit_pct >= (p["profit_target_pct"] / 100.0):
-            print(f"DEBUG: Profit target hit: {total_profit_pct*100:.2f}% >= {p['profit_target_pct']}%")
-            self._activate_performance_pause("Profit target reached", p["cooldown_period_hours"])
-            return
+            if not self.vars.profit_target_triggered:
+                print(f"DEBUG: Profit target hit: {total_profit_pct*100:.2f}% >= {p['profit_target_pct']}%")
+                self.vars.profit_target_triggered = True
+                self._activate_performance_pause("Profit target reached", p["cooldown_period_hours"])
+                return
+            else:
+                print(f"DEBUG: Profit target already triggered, in cooldown period")
         
-        # Log risk snapshot
+        # Log risk snapshot with full profit details
         try:
             self.grid_logger.log_row({
                 'event': 'RISK',
                 'equity': equity,
                 'dd_pct': dd * 100.0,
                 'daily_loss': daily_loss,
-                'extra': f'trailing_dd={trailing_dd*100:.1f}%,profit={total_profit_pct*100:.1f}%'
+                'extra': f'start_equity={self.vars.start_equity:.2f},realised_profit={self.vars.realised_profit:.2f},unrealised_pnl={unrealised_pnl:.2f},profit_pct={total_profit_pct*100:.2f}%,trailing_dd={trailing_dd*100:.1f}%'
             })
         except Exception:
             pass
@@ -543,13 +577,15 @@ class CryptoGridMRStrategy(Strategy):
         pause_until = datetime.utcnow() + timedelta(hours=hours)
         self.vars.paused_until = pause_until.isoformat()
         
+        equity = self.get_portfolio_value() or 0.0
         self.log_message(f"PERFORMANCE PAUSE: {reason} - paused until {pause_until.strftime('%Y-%m-%d %H:%M')} UTC", color="yellow")
         
         try:
             self.grid_logger.log_row({
                 'event': 'PERFORMANCE_PAUSE',
                 'reason': reason,
-                'extra': f'paused_until={self.vars.paused_until}'
+                'equity': equity,
+                'extra': f'paused_until={self.vars.paused_until},start_equity={self.vars.start_equity:.2f},realised_profit={self.vars.realised_profit:.2f}'
             })
         except Exception:
             pass
@@ -567,14 +603,16 @@ class CryptoGridMRStrategy(Strategy):
             if datetime.utcnow() < pause_until.replace(tzinfo=None):
                 return True
             else:
-                # Cooldown period over
+                # Cooldown period over - reset debounce flag and resume
                 self.vars.paused_until = None
+                self.vars.profit_target_triggered = False  # Allow profit target to trigger again
                 self.log_message("Performance cooldown period ended - resuming trading", color="green")
                 self._save_state()
                 return False
         except Exception:
             # If we can't parse the timestamp, assume cooldown is over
             self.vars.paused_until = None
+            self.vars.profit_target_triggered = False
             return False
 
     def _check_losing_streak(self):
@@ -644,50 +682,99 @@ class CryptoGridMRStrategy(Strategy):
         now_dt = self.get_datetime()
         mid = None
         spread_pct = None
-        reasons = []
+        quote_method = None  # Track which method succeeded
         
+        # Method 1: Try get_quote() for bid/ask spread (most accurate)
         try:
-            # Use get_last_price like the working BTC_long.py strategy
-            last_price = self.get_last_price(self.base_asset)
-            if last_price is not None and last_price > 0:
-                mid = float(last_price)
-                spread_pct = 0.001  # Default 0.1% spread for crypto
-                self.vars.last_quote_ts = now_dt
-                print(f"DEBUG: Got BTC price from get_last_price: ${mid}")
+            if not self.is_backtesting:
+                q = self.get_quote(self.base_asset, quote=self.quote_asset_for_orders)
             else:
-                print(f"DEBUG: get_last_price returned None or invalid price: {last_price}")
-                reasons.append(f"get_last_price invalid: {last_price}")
+                q = self.get_quote(self.base_asset)
+                
+            if q is not None:
+                bid = float(q.bid) if q.bid is not None and q.bid > 0 else None
+                ask = float(q.ask) if q.ask is not None and q.ask > 0 else None
+                
+                # Accept quote if we have both bid and ask
+                if bid and ask and ask >= bid:
+                    mid = (bid + ask) / 2.0
+                    spread_pct = (ask - bid) / mid
+                    self.vars.last_quote_ts = now_dt
+                    quote_method = "get_quote(bid+ask)"
+                    print(f"DEBUG: Got quote - bid={bid}, ask={ask}, mid={mid:.2f}, spread={spread_pct*100:.3f}%")
+                # Fallback: Accept quote if we have only one side
+                elif bid:
+                    mid = bid
+                    spread_pct = 0.001  # Assume 0.1% spread
+                    self.vars.last_quote_ts = now_dt
+                    quote_method = "get_quote(bid_only)"
+                    print(f"DEBUG: Got quote with bid only: {bid:.2f}, assuming spread=0.1%")
+                    self.log_message(f"Warning: Using bid-only quote ({bid:.2f}), ask unavailable", color="yellow")
+                elif ask:
+                    mid = ask
+                    spread_pct = 0.001  # Assume 0.1% spread
+                    self.vars.last_quote_ts = now_dt
+                    quote_method = "get_quote(ask_only)"
+                    print(f"DEBUG: Got quote with ask only: {ask:.2f}, assuming spread=0.1%")
+                    self.log_message(f"Warning: Using ask-only quote ({ask:.2f}), bid unavailable", color="yellow")
         except Exception as e:
-            print(f"DEBUG: get_last_price failed: {e}")
-            reasons.append(f"get_last_price error: {e}")
-            # Fallback to quote method
-            try:
-                if not self.is_backtesting:
-                    q = self.get_quote(self.base_asset, quote=self.quote_asset_for_orders)
-                else:
-                    q = self.get_quote(self.base_asset)
-                    
-                if q is not None:
-                    if q.bid is not None and q.ask is not None and q.bid > 0 and q.ask > 0 and q.ask >= q.bid:
-                        mid = (q.bid + q.ask) / 2.0
-                        if q.ask > 0 and mid and mid > 0:
-                            spread_pct = (q.ask - q.bid) / mid
-                        self.vars.last_quote_ts = now_dt
-                        print(f"DEBUG: Got BTC price from quote: ${mid}")
-            except Exception as e2:
-                print(f"DEBUG: get_quote also failed: {e2}")
-                reasons.append(f"get_quote error: {e2}")
+            print(f"DEBUG: get_quote failed: {e}")
         
-        print(f"DEBUG: Final mid={mid}, spread_pct={spread_pct}")
-        # Diagnostic CSV: if we failed to obtain a quote, record a NO_QUOTE event once per call
+        # Method 2: Fallback to get_last_price() if quote method failed
         if mid is None:
+            try:
+                last_price = self.get_last_price(self.base_asset)
+                if last_price is not None and last_price > 0:
+                    mid = float(last_price)
+                    spread_pct = 0.001  # Default 0.1% spread for crypto
+                    self.vars.last_quote_ts = now_dt
+                    quote_method = "get_last_price"
+                    print(f"DEBUG: Got BTC price from get_last_price: ${mid:.2f}")
+                    self.log_message(f"Using last trade price fallback: ${mid:.2f}", color="yellow")
+                else:
+                    print(f"DEBUG: get_last_price returned None or invalid price: {last_price}")
+            except Exception as e:
+                print(f"DEBUG: get_last_price failed: {e}")
+        
+        # Method 3: Last resort - try get_price()
+        if mid is None:
+            try:
+                price = self.get_price(self.base_asset)
+                if price is not None and price > 0:
+                    mid = float(price)
+                    spread_pct = 0.001  # Default 0.1% spread
+                    self.vars.last_quote_ts = now_dt
+                    quote_method = "get_price"
+                    print(f"DEBUG: Got BTC price from get_price: ${mid:.2f}")
+                    self.log_message(f"Using get_price fallback: ${mid:.2f}", color="yellow")
+            except Exception as e:
+                print(f"DEBUG: get_price failed: {e}")
+        
+        # Log diagnostic info if all methods failed
+        if mid is None:
+            print(f"DEBUG: ALL quote methods failed - no price available")
+            self.log_message("ERROR: Unable to retrieve price from any source", color="red")
             try:
                 self.grid_logger.log_row({
                     'event': 'NO_QUOTE',
-                    'reason': '; '.join(reasons) if reasons else 'no price source available',
+                    'reason': 'All price retrieval methods failed',
+                    'extra': f'is_backtesting={self.is_backtesting}'
                 })
             except Exception:
                 pass
+        else:
+            # Log successful quote retrieval
+            print(f"DEBUG: Final mid=${mid:.2f}, spread={spread_pct*100:.3f}%, method={quote_method}")
+            try:
+                self.grid_logger.log_row({
+                    'event': 'QUOTE',
+                    'mid': mid,
+                    'spread_pct': spread_pct * 100 if spread_pct else None,
+                    'extra': f'method={quote_method}'
+                })
+            except Exception:
+                pass
+        
         return mid, spread_pct
 
     def _update_ema_and_trend(self, mid):
@@ -1121,6 +1208,14 @@ class CryptoGridMRStrategy(Strategy):
         print(f"ITERATION START - Portfolio: ${self.get_portfolio_value():.2f}")
         p = self.get_parameters()
 
+        # Initialize start_equity on first iteration if not set (persistent baseline)
+        if self.vars.start_equity is None or self.vars.start_equity == 0:
+            current_equity = self.get_portfolio_value() or 100000.0
+            self.vars.start_equity = current_equity
+            print(f"DEBUG: Set persistent start_equity baseline: ${current_equity:.2f}")
+            self.log_message(f"Set start_equity baseline: ${current_equity:.2f}", color="green")
+            self._save_state()
+
         # If a stale kill flag was persisted, optionally clear it automatically when enabled=True
         if p["auto_clear_kill"] and p["enabled"] and self.vars.killed:
             self.vars.killed = False
@@ -1192,19 +1287,20 @@ class CryptoGridMRStrategy(Strategy):
             print(f"DEBUG: Market NOT trending - safe to trade")
         
         # Update ATR and compute step
+        # IMPORTANT: Update last_mid BEFORE calling _update_atr() so it has previous price for true range calc
         atr = self._update_atr(mid)
+        self.vars.last_mid = mid  # Store for next iteration
+        
         if atr is not None:
             step_pct = max(self._enforced_step_pct(), (atr * p["atr_factor"]) / mid)
+            print(f"DEBUG: ATR ready - ATR=${atr:.2f}, step_pct={step_pct*100:.4f}%")
         else:
-            print("ATR not ready - skipping this iteration")
-            self.log_message("ATR not ready (need more samples); skipping this iteration.", color="yellow")
+            print(f"DEBUG: ATR not ready - have {len(self.atr_values)}/{p['atr_window']} samples")
+            self.log_message(f"ATR not ready ({len(self.atr_values)}/{p['atr_window']} samples); skipping this iteration.", color="yellow")
             return
             
         # Store ATR for ladder rebuild
         self.vars.atr_current = atr
-        
-        # Update last_mid for next ATR calculation
-        self.vars.last_mid = mid
 
         # Apply stall kill-switch only in live trading
         now_dt = self.get_datetime()
@@ -1255,9 +1351,29 @@ class CryptoGridMRStrategy(Strategy):
 
     # -------------------- Fills: Re-quote the counterpart rung --------------------
     def on_filled_order(self, position, order, price, quantity, multiplier):
-        self.log_message(f"FILL: {order.side} {quantity} @ {price}", color="green")
+        filled_px = float(price) if price is not None else 0.0
+        filled_qty = float(quantity) if quantity is not None else 0.0
+        notional = filled_px * filled_qty
+        
+        # Update realized profit: sells add profit, buys subtract cost
+        if order.side == Order.OrderSide.SELL:
+            self.vars.realised_profit += notional
+            print(f"FILL: SELL {filled_qty:.6f} @ ${filled_px:.2f} = ${notional:.2f} (realised_profit now ${self.vars.realised_profit:.2f})")
+        elif order.side == Order.OrderSide.BUY:
+            self.vars.realised_profit -= notional
+            print(f"FILL: BUY {filled_qty:.6f} @ ${filled_px:.2f} = ${notional:.2f} (realised_profit now ${self.vars.realised_profit:.2f})")
+        
+        self.log_message(f"FILL: {order.side} {quantity} @ {price} (realised_profit=${self.vars.realised_profit:.2f})", color="green")
+        
         try:
-            self.grid_logger.log_row({'event': 'FILL', 'side': str(order.side), 'qty': float(quantity), 'price': float(price)})
+            self.grid_logger.log_row({
+                'event': 'FILL', 
+                'side': str(order.side), 
+                'qty': filled_qty, 
+                'price': filled_px,
+                'notional': notional,
+                'extra': f'realised_profit={self.vars.realised_profit:.2f}'
+            })
         except Exception:
             pass
         
